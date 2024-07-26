@@ -31,11 +31,11 @@ pub struct DelaySessionStore<K> {
 
 impl<K> DelaySessionStore<K>
 where
-    K: Clone + Eq + Hash + Send + Sync + 'static,
+    K: Clone + Eq + Hash + Send + 'static,
 {
     pub async fn push_signal<D>(
         &self,
-        key: K,
+        mut key: K,
         instant: Instant,
         mut decoder_factory: impl FnMut() -> D + Send + 'static,
     ) -> Result<(), ()>
@@ -43,14 +43,16 @@ where
         D: DelayDecoder + Send + 'static,
     {
         match self.sender_map.lock().await.entry(key.clone()) {
-            Entry::Occupied(entry) => entry
-                .get()
-                .send(Signal {
-                    instant,
-                    timeout_instant: instant + self.timeout_duration,
-                })
-                .await
-                .map_err(|_| ()),
+            Entry::Occupied(entry) => {
+                let sender = entry.get();
+                sender
+                    .send(Signal {
+                        instant,
+                        timeout_instant: instant + self.timeout_duration,
+                    })
+                    .await
+                    .map_err(|_| ())
+            }
 
             Entry::Vacant(entry) => {
                 let (signal_sender, session) =
@@ -61,17 +63,39 @@ where
                 let result_sender = self.result_sender.clone();
 
                 tokio::spawn(async move {
-                    struct SenderRemoveGuard<'a, K>
+                    struct UniqueSenderRemoveGuard<'a, K>
                     where
-                        K: Clone + Eq + Hash + Send + Sync + 'static,
+                        K: Clone + Eq + Hash + Send + 'static,
+                    {
+                        key: &'a mut K,
+                        sender_map: Weak<SharedSignalSenderMap<K>>,
+                    }
+
+                    impl<K> Drop for UniqueSenderRemoveGuard<'_, K>
+                    where
+                        K: Clone + Eq + Hash + Send + 'static,
+                    {
+                        fn drop(&mut self) {
+                            if let Some(map) = self.sender_map.upgrade() {
+                                let key = self.key.clone();
+                                tokio::spawn(async move {
+                                    map.lock().await.remove(&key);
+                                });
+                            }
+                        }
+                    }
+
+                    struct SharedSenderRemoveGuard<'a, K>
+                    where
+                        K: Clone + Eq + Hash + Send + 'static,
                     {
                         key: &'a K,
                         sender_map: Weak<SharedSignalSenderMap<K>>,
                     }
 
-                    impl<K> Drop for SenderRemoveGuard<'_, K>
+                    impl<K> Drop for SharedSenderRemoveGuard<'_, K>
                     where
-                        K: Clone + Eq + Hash + Send + Sync + 'static,
+                        K: Clone + Eq + Hash + Send + 'static,
                     {
                         fn drop(&mut self) {
                             if let Some(map) = self.sender_map.upgrade() {
@@ -85,8 +109,8 @@ where
 
                     let mut session = session;
                     loop {
-                        let guard = SenderRemoveGuard {
-                            key: &key,
+                        let guard = UniqueSenderRemoveGuard {
+                            key: &mut key,
                             sender_map: sender_map.clone(),
                         };
 
@@ -94,27 +118,42 @@ where
 
                         forget(guard);
 
+                        let guard = SharedSenderRemoveGuard {
+                            key: &key,
+                            sender_map: sender_map.clone(),
+                        };
+
                         session =
                             DelaySession::start_with_receiver(decoder_factory(), signal_receiver);
 
                         if !session.is_open() {
                             if let Some(map) = sender_map.upgrade() {
                                 let key_clone = key.clone();
+                                forget(guard);
+                                let key_mut = &mut key;
                                 join!(
-                                    async {
-                                        map.lock().await.remove(&key);
+                                    async move {
+                                        map.lock().await.remove(&*key_mut);
                                     },
                                     async move {
                                         let _ = result_sender.send((key_clone, result)).await;
                                     }
                                 );
                             } else {
+                                forget(guard);
                                 let _ = result_sender.send((key, result)).await;
                             }
                             break;
+                        } else {
+                            let key_clone = key.clone();
+                            forget(guard);
+                            let guard = UniqueSenderRemoveGuard {
+                                key: &mut key,
+                                sender_map: sender_map.clone(),
+                            };
+                            let _ = result_sender.send((key_clone, result)).await;
+                            forget(guard);
                         }
-
-                        let _ = result_sender.send((key.clone(), result)).await;
                     }
                 });
 
